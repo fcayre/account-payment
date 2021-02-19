@@ -1,14 +1,27 @@
 import logging
 
-from iso8601 import parse_date
+from coreapi.exceptions import ErrorMessage
 
-from odoo import models, fields, api
-from odoo.tools.safe_eval import safe_eval
+from odoo import models, fields, api, _
+from odoo.exceptions import UserError
 
 from .slimpay_utils import SlimpayClient
 
 
 _logger = logging.getLogger(__name__)
+
+
+class AccountPayment(models.Model):
+    _inherit = 'account.payment'
+
+    def _do_payment(self):
+        """Add current payment in the context for use in the payment
+        transaction, that may make good use of:
+        - the in or out direction
+        - the `communication` field
+        """
+        _self = self.with_context({'tx_from_payment': self})
+        return super(AccountPayment, _self)._do_payment()
 
 
 class PaymentAcquirerSlimpay(models.Model):
@@ -96,6 +109,29 @@ class PaymentAcquirerSlimpay(models.Model):
 class SlimpayTransaction(models.Model):
     _inherit = 'payment.transaction'
 
+    def _is_out_transaction(self):
+        self.ensure_one()
+        payment = self.env.context.get('tx_from_payment')
+        return bool(payment) and payment.payment_type == 'outbound'
+
+    @api.multi
+    def _label(self):
+        """Try hard to return a useful label, using:
+        - the 'slimpay_payin_label' of the context, if any
+        - the `communication` field of the payment found in
+          'tx_from_payment' key of the context, if any
+        - the `reference` field of current transaction, if not empty
+        - 'TR%d' % self.id as a last resort.
+        """
+        context = self.env.context
+        if 'slimpay_payin_label' in context:
+            return context['slimpay_payin_label']
+        else:
+            payment = context.get('tx_from_payment')
+            if payment and payment.communication:
+                return payment.communication
+            return self.reference or 'TR%d' % self.id
+
     @api.multi
     def slimpay_s2s_do_transaction(self, **kwargs):
         """ Perform a payment through a server to server call using a previously
@@ -106,13 +142,14 @@ class SlimpayTransaction(models.Model):
         mandate_ref = client.action('GET', 'get-mandates', params={
             'id': self.payment_token_id.acquirer_ref})['reference']
         _logger.debug('Found mandate reference: %s', mandate_ref)
-        label = self.env.context.get(
-            'slimpay_payin_label', self.reference or 'TR%d' % self.id)
-        result, acquirer_reference = client.create_payin(
-            mandate_ref, self.amount, self.currency_id.name,
-            self.currency_id.decimal_places, label)
-        _logger.debug('Payin creation result: %s, reference: %s',
-                      result, acquirer_reference)
-        self.update({'state': 'done' if result else 'error',
+        amount = round(self.amount, self.currency_id.decimal_places)
+        try:
+            acquirer_reference = client.create_payment(
+                mandate_ref, amount, self.currency_id.name,
+                self._label(), out=self._is_out_transaction())
+            _logger.debug('Payment creation result: %s', acquirer_reference)
+        except ErrorMessage as exc:
+            raise UserError(_(exc))
+        self.update({'state': 'done' if acquirer_reference else 'error',
                      'acquirer_reference': acquirer_reference})
-        return result
+        return bool(acquirer_reference)
